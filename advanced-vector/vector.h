@@ -140,27 +140,7 @@ public:
                 Vector tmp(rhs);
                 Swap(tmp);
             } else {
-                size_t min_size = std::min(size_, rhs.size_);
-                
-                for (size_t i = 0; i < min_size; ++i) {
-                    buffer_[i] = rhs.buffer_[i];
-                }
-                
-                if (rhs.size_ > size_) {
-                    std::uninitialized_copy_n(
-                        rhs.buffer_.GetAddress() + size_, 
-                        rhs.size_ - size_, 
-                        buffer_.GetAddress() + size_
-                    );
-                }
-                else if (size_ > rhs.size_) {
-                    std::destroy_n(
-                        buffer_.GetAddress() + rhs.size_, 
-                        size_ - rhs.size_
-                    );
-                }
-                
-                size_ = rhs.size_;
+                AssignFromVector(rhs);
             }
         }
         return *this;
@@ -278,6 +258,8 @@ public:
 
     template <typename... Args>
     iterator Emplace(const_iterator pos, Args&&... args) {
+        assert(pos >= cbegin() && pos <= cend() && "Iterator out of range");
+        
         size_t index = pos - cbegin();
 
         if (index == size_) {
@@ -286,64 +268,10 @@ public:
         }
 
         if (size_ == Capacity()) {
-            size_t new_capacity = size_ == 0 ? 1 : size_ * 2;
-            RawMemory<T> new_buffer(new_capacity);
-            T* new_buf = new_buffer.GetAddress();
-            T* old_buf = buffer_.GetAddress();
-
-            new (new_buf + index) T(std::forward<Args>(args)...);
-
-            try {
-                if constexpr (std::is_nothrow_move_constructible_v<T> ||
-                              !std::is_copy_constructible_v<T>) {
-                    std::uninitialized_move_n(old_buf, index, new_buf);
-                } else {
-                    std::uninitialized_copy_n(old_buf, index, new_buf);
-                }
-            } catch (...) {
-                std::destroy_at(new_buf + index);
-                throw;
-            }
-
-            try {
-                if constexpr (std::is_nothrow_move_constructible_v<T> ||
-                              !std::is_copy_constructible_v<T>) {
-                    std::uninitialized_move_n(old_buf + index, size_ - index,
-                                              new_buf + index + 1);
-                } else {
-                    std::uninitialized_copy_n(old_buf + index, size_ - index,
-                                              new_buf + index + 1);
-                }
-            } catch (...) {
-                std::destroy_n(new_buf, index);
-                std::destroy_at(new_buf + index);
-                throw;
-            }
-
-            std::destroy_n(old_buf, size_);
-            buffer_.Swap(new_buffer);
-            ++size_;
-            return begin() + index;
+            return EmplaceWithReallocation(index, std::forward<Args>(args)...);
         }
 
-        T tmp(std::forward<Args>(args)...);
-
-        new (buffer_ + size_) T(std::move(buffer_[size_ - 1]));
-        ++size_; 
-
-        try {
-            for (size_t i = size_ - 2; i > index; --i) {
-                buffer_[i] = std::move(buffer_[i - 1]);
-            }
-        } catch (...) {
-            std::destroy_at(buffer_ + size_ - 1);
-            --size_;
-            throw;
-        }
-
-        buffer_[index] = std::move(tmp);
-
-        return begin() + index;
+        return EmplaceInPlace(index, std::forward<Args>(args)...);
     }
 
     iterator Insert(const_iterator pos, const T& value) {
@@ -355,13 +283,12 @@ public:
     }
 
     iterator Erase(const_iterator pos) noexcept(std::is_nothrow_move_assignable_v<T>) {
+        assert(pos >= cbegin() && pos < cend() && "Iterator out of range");
+        
         size_t index = pos - cbegin();
-        assert(index < size_);
-
-        for (size_t i = index; i + 1 < size_; ++i) {
-            buffer_[i] = std::move(buffer_[i + 1]);
-        }
-        std::destroy_at(buffer_ + size_ - 1);
+        
+        std::move(begin() + index + 1, end(), begin() + index);
+        std::destroy_at(buffer_.GetAddress() + size_ - 1);
         --size_;
         return begin() + index;
     }
@@ -376,10 +303,13 @@ private:
             new (new_buffer + size_) T(std::forward<U>(value));
             
             try {
-                if constexpr (std::is_nothrow_move_constructible_v<T> || !std::is_copy_constructible_v<T>) {
-                    std::uninitialized_move_n(buffer_.GetAddress(), size_, new_buffer.GetAddress());
+                if constexpr (std::is_nothrow_move_constructible_v<T> || 
+                            !std::is_copy_constructible_v<T>) {
+                    std::uninitialized_move_n(buffer_.GetAddress(), size_, 
+                                            new_buffer.GetAddress());
                 } else {
-                    std::uninitialized_copy_n(buffer_.GetAddress(), size_, new_buffer.GetAddress());
+                    std::uninitialized_copy_n(buffer_.GetAddress(), size_, 
+                                            new_buffer.GetAddress());
                 }
             } catch (...) {
                 std::destroy_at(new_buffer + size_);
@@ -392,6 +322,90 @@ private:
             new (buffer_ + size_) T(std::forward<U>(value));
         }
         ++size_;
+    }
+
+    void AssignFromVector(const Vector& rhs) {
+        size_t min_size = std::min(size_, rhs.size_);
+        
+        std::copy(rhs.buffer_.GetAddress(), 
+                  rhs.buffer_.GetAddress() + min_size, 
+                  buffer_.GetAddress());
+        
+        if (rhs.size_ > size_) {
+            std::uninitialized_copy_n(
+                rhs.buffer_.GetAddress() + size_, 
+                rhs.size_ - size_, 
+                buffer_.GetAddress() + size_
+            );
+        } else if (size_ > rhs.size_) {
+            std::destroy_n(
+                buffer_.GetAddress() + rhs.size_, 
+                size_ - rhs.size_
+            );
+        }
+        
+        size_ = rhs.size_;
+    }
+
+    template <typename... Args>
+    iterator EmplaceWithReallocation(size_t index, Args&&... args) {
+        size_t new_capacity = size_ == 0 ? 1 : size_ * 2;
+        RawMemory<T> new_buffer(new_capacity);
+        T* new_buf = new_buffer.GetAddress();
+        T* old_buf = buffer_.GetAddress();
+
+        new (new_buf + index) T(std::forward<Args>(args)...);
+
+        try {
+            if constexpr (std::is_nothrow_move_constructible_v<T> ||
+                        !std::is_copy_constructible_v<T>) {
+                std::uninitialized_move_n(old_buf, index, new_buf);
+            } else {
+                std::uninitialized_copy_n(old_buf, index, new_buf);
+            }
+        } catch (...) {
+            std::destroy_at(new_buf + index);
+            throw;
+        }
+
+        try {
+            if constexpr (std::is_nothrow_move_constructible_v<T> ||
+                        !std::is_copy_constructible_v<T>) {
+                std::uninitialized_move_n(old_buf + index, size_ - index,
+                                        new_buf + index + 1);
+            } else {
+                std::uninitialized_copy_n(old_buf + index, size_ - index,
+                                        new_buf + index + 1);
+            }
+        } catch (...) {
+            std::destroy_n(new_buf, index);
+            std::destroy_at(new_buf + index);
+            throw;
+        }
+
+        std::destroy_n(old_buf, size_);
+        buffer_.Swap(new_buffer);
+        ++size_;
+        return begin() + index;
+    }
+
+    template <typename... Args>
+    iterator EmplaceInPlace(size_t index, Args&&... args) {
+        T tmp(std::forward<Args>(args)...);
+
+        new (buffer_ + size_) T(std::move(buffer_[size_ - 1]));
+        ++size_; 
+
+        try {
+            std::move_backward(begin() + index, end() - 2, end() - 1);
+        } catch (...) {
+            std::destroy_at(buffer_ + size_ - 1);
+            --size_;
+            throw;
+        }
+
+        buffer_[index] = std::move(tmp);
+        return begin() + index;
     }
 
 private:
